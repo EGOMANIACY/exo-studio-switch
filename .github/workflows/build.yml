@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            file: EXO-Studio-Switch.exe
+          - os: ubuntu-22.04
+            file: EXO-Studio-Switch-linux
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -22,16 +29,39 @@ jobs:
       - name: Install packages
         run: pip install -r requirements.txt
 
-      - name: Build the exe
-        run: pyinstaller --onefile --noconsole --name "EXO Studio Switch" studio_switch.py
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pyinstaller --onefile --noconsole --hidden-import pystray._xorg --hidden-import pystray._appindicator --name EXO-Studio-Switch studio_switch.py
+            mv dist/EXO-Studio-Switch "dist/${{ matrix.file }}"
+          else
+            pyinstaller --onefile --noconsole --name EXO-Studio-Switch studio_switch.py
+          fi
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" "dist/EXO Studio Switch.exe" --title "${{ github.ref_name }}" --notes "Download EXO Studio Switch.exe and run it."
+      - name: Check it starts
+        shell: bash
+        run: '"dist/${{ matrix.file }}" --check'
+        if: runner.os == 'Linux'
 
       - uses: actions/upload-artifact@v7
         with:
-          name: EXO Studio Switch
-          path: dist/EXO Studio Switch.exe
+          name: ${{ matrix.file }}
+          path: dist/${{ matrix.file }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: files
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x files/EXO-Studio-Switch-linux
+          gh release create "${{ github.ref_name }}" files/* -R "${{ github.repository }}" --title "${{ github.ref_name }}" --notes "Windows: download EXO-Studio-Switch.exe and run it. Linux: download EXO-Studio-Switch-linux, run chmod +x on it, then run it. It sits in the system tray and starts when you log in."

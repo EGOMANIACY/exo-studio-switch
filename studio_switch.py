@@ -1,36 +1,48 @@
-import ctypes
 import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import urllib.request
-import winreg
 from dataclasses import dataclass
 from pathlib import Path
 
-import pystray
 from PIL import Image, ImageDraw
 
 NAME = "EXO Studio Switch"
 SERVER = os.environ.get("EXO_STUDIO_SWITCH_URL", "http://207.127.92.128:8787/studio-switch")
 POLL_SECONDS = 10
 WARNING_SECONDS = 30
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 PLACE = re.compile(r"placeId[: ](\d+)", re.I)
 UNIVERSE = re.compile(r"universeId[: ](\d+)", re.I)
-NO_WINDOW = subprocess.CREATE_NO_WINDOW
 GOLD = "#C9A227"
 DARK = "#111111"
+WINDOWS = sys.platform == "win32"
 
-DATA = Path(os.environ["APPDATA"]) / NAME
+if WINDOWS:
+    import ctypes
+    import winreg
+
+    RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW
+    DATA = Path(os.environ["APPDATA"]) / NAME
+else:
+    import fcntl
+
+    NO_WINDOW = 0
+    CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    AUTOSTART = CONFIG / "autostart" / "exo-studio-switch.desktop"
+    DATA = CONFIG / "exo-studio-switch"
+
 DATA.mkdir(parents=True, exist_ok=True)
 SETTINGS = DATA / "settings.json"
-logging.basicConfig(filename=DATA / "log.txt", level=logging.INFO, format="%(asctime)s %(message)s")
+LOG = DATA / "log.txt"
+logging.basicConfig(filename=LOG, level=logging.INFO, format="%(asctime)s %(message)s")
 
 
 @dataclass
@@ -40,11 +52,20 @@ class Studio:
     universe_id: str
 
 
-def command() -> str:
-    return f'"{sys.executable}"' if getattr(sys, "frozen", False) else f'"{sys.executable}" "{Path(__file__).resolve()}"'
+def command() -> list[str]:
+    return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, str(Path(__file__).resolve())]
 
 
-def starts_with_windows() -> bool:
+def open_path(target: str):
+    if WINDOWS:
+        os.startfile(target)
+    else:
+        subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def starts_with_system() -> bool:
+    if not WINDOWS:
+        return AUTOSTART.exists()
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             winreg.QueryValueEx(key, NAME)
@@ -53,10 +74,18 @@ def starts_with_windows() -> bool:
         return False
 
 
-def set_start_with_windows(on: bool):
+def set_starts_with_system(on: bool):
+    if not WINDOWS:
+        if on:
+            AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+            line = " ".join(f'"{part}"' for part in command())
+            AUTOSTART.write_text(f"[Desktop Entry]\nType=Application\nName={NAME}\nExec={line}\nX-GNOME-Autostart-enabled=true\n")
+        else:
+            AUTOSTART.unlink(missing_ok=True)
+        return
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if on:
-            winreg.SetValueEx(key, NAME, 0, winreg.REG_SZ, command())
+            winreg.SetValueEx(key, NAME, 0, winreg.REG_SZ, " ".join(f'"{part}"' for part in command()))
         else:
             try:
                 winreg.DeleteValue(key, NAME)
@@ -66,11 +95,23 @@ def set_start_with_windows(on: bool):
 
 def first_run():
     if SETTINGS.exists():
-        if starts_with_windows():
-            set_start_with_windows(True)
+        if starts_with_system():
+            set_starts_with_system(True)
         return
-    set_start_with_windows(True)
+    set_starts_with_system(True)
     SETTINGS.write_text(json.dumps({"firstRun": time.time()}))
+
+
+def already_running() -> bool:
+    if WINDOWS:
+        return bool(ctypes.windll.kernel32.CreateMutexW(None, False, "EXO.StudioSwitch")) and ctypes.windll.kernel32.GetLastError() == 183
+    global LOCK
+    LOCK = open(DATA / "running.lock", "w")
+    try:
+        fcntl.flock(LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True
 
 
 def publishing() -> list[dict]:
@@ -78,19 +119,34 @@ def publishing() -> list[dict]:
         return json.load(response).get("publishing", [])
 
 
-def studios() -> list[Studio]:
+def studio_lines() -> list[tuple[int, str]]:
+    if not WINDOWS:
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                line = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                continue
+            if "RobloxStudio" in line:
+                found.append((int(entry.name), line))
+        return found
     query = "Get-CimInstance Win32_Process -Filter \"Name like 'RobloxStudio%'\" | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
     out = subprocess.run(["powershell", "-NoProfile", "-Command", query], capture_output=True, text=True, creationflags=NO_WINDOW).stdout.strip()
     if not out:
         return []
     found = json.loads(out)
+    return [(p["ProcessId"], p.get("CommandLine") or "") for p in (found if isinstance(found, list) else [found])]
+
+
+def studios() -> list[Studio]:
     result = []
-    for process in found if isinstance(found, list) else [found]:
-        line = process.get("CommandLine") or ""
+    for pid, line in studio_lines():
         place = PLACE.search(line)
         universe = UNIVERSE.search(line)
         if place:
-            result.append(Studio(process["ProcessId"], place.group(1), universe.group(1) if universe else ""))
+            result.append(Studio(pid, place.group(1), universe.group(1) if universe else ""))
     return result
 
 
@@ -125,12 +181,18 @@ def warn(names: list[str], seconds: int):
 
 
 def close(studio: Studio):
-    subprocess.run(["taskkill", "/PID", str(studio.pid), "/F"], capture_output=True, creationflags=NO_WINDOW)
+    if WINDOWS:
+        subprocess.run(["taskkill", "/PID", str(studio.pid), "/F"], capture_output=True, creationflags=NO_WINDOW)
+    else:
+        try:
+            os.kill(studio.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     logging.info("closed Studio %s on place %s", studio.pid, studio.place_id)
 
 
 def reopen(studio: Studio):
-    os.startfile(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{studio.place_id}+universeId:{studio.universe_id}")
+    open_path(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{studio.place_id}+universeId:{studio.universe_id}")
     logging.info("reopened place %s", studio.place_id)
 
 
@@ -166,22 +228,10 @@ def icon_image() -> Image.Image:
     return image
 
 
-def main():
-    if "--test-warning" in sys.argv:
-        warn(["Burial Grounds"], 10)
-        return
-    if "--check" in sys.argv:
-        print(studios())
-        print(publishing())
-        return
-    if ctypes.windll.kernel32.CreateMutexW(None, False, "EXO.StudioSwitch") and ctypes.windll.kernel32.GetLastError() == 183:
-        return
-    first_run()
-    stop = threading.Event()
-    threading.Thread(target=watch, args=(stop,), daemon=True).start()
-    logging.info("watching %s", SERVER)
+def tray(stop: threading.Event):
+    import pystray
 
-    def quit_app(icon: pystray.Icon):
+    def quit_app(icon):
         stop.set()
         icon.stop()
 
@@ -190,11 +240,32 @@ def main():
         icon_image(),
         f"{NAME}: closes Studio for EXO publishes",
         pystray.Menu(
-            pystray.MenuItem("Start with Windows", lambda: set_start_with_windows(not starts_with_windows()), checked=lambda _: starts_with_windows()),
-            pystray.MenuItem("Open log", lambda: os.startfile(DATA / "log.txt")),
+            pystray.MenuItem("Start with Windows" if WINDOWS else "Start on login", lambda: set_starts_with_system(not starts_with_system()), checked=lambda _: starts_with_system()),
+            pystray.MenuItem("Open log", lambda: open_path(str(LOG))),
             pystray.MenuItem("Quit", quit_app),
         ),
     ).run()
+
+
+def main():
+    if "--test-warning" in sys.argv:
+        warn(["Burial Grounds"], 10)
+        return
+    if "--check" in sys.argv:
+        print(studios())
+        print(publishing())
+        return
+    if already_running():
+        return
+    first_run()
+    stop = threading.Event()
+    threading.Thread(target=watch, args=(stop,), daemon=True).start()
+    logging.info("watching %s", SERVER)
+    try:
+        tray(stop)
+    except Exception:
+        logging.exception("no tray icon, running without one")
+        stop.wait()
 
 
 if __name__ == "__main__":
