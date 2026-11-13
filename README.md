@@ -5,7 +5,7 @@ Roblox won't publish a place while someone has it open in Studio. When the EXO p
 Team Create already has your map edits and Studio keeps your script drafts, so a close loses nothing except edits from the last second or two.
 
 ## Install
-1. Download **EXO Studio Switch.exe** from the [latest release](../../releases/latest).
+1. Download **EXO.Studio.Switch.exe** from the [latest release](../../releases/latest).
 2. Run it. Windows may say "Windows protected your PC" because the app isn't code-signed: click **More info**, then **Run anyway**.
 3. It sits in the system tray (the gold E). It starts with Windows from then on.
 
